@@ -1,5 +1,5 @@
 .*.sw?
-/sem
-/sem-echo
+/it
+/it-echo
 /entities
 /data.txt

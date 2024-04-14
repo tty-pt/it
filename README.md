@@ -1,6 +1,6 @@
 # Introduction
-This is a solution for calculating shared expenses between people living in the same house. It relies on a human-readable text file that has information about bills, times new people arrive and leave, payments, etc.
-From this file, debt between participants can be calculated freely and consistently.
+This is based on [sem](https://github.com/quirinpa/sem). It is a tool for searching through an interval tree.
+Meaning you can provide (START and STOP) events with corresponding ids, and you can search which ids were present at a given moment
 
 # Building
 Here's how to build on Alpine Linux:
@@ -16,75 +16,26 @@ To build on OpenBSD, just "make" will be enough.
 # Running
 You can:
 ```sh
-./sem -?
+./it -?
 ```
-To find out about the available options. Otherwise, feed a file to sem:
+To find out about the available options.
+Otherwise, feed a file to sem:
 ```sh
-./sem < data.txt
+./it "2023-04-01" < data.txt
 ```
-You will get a result like:
-```
-leon owes quirinpa 58.45€
-tomas owes quirinpa 2.10€
-tomas owes leon 29.54€
-elias owes leon 23.55€
-vitor owes quirinpa 278.95€
-emad owes leon 108.86
-```
-If you run it with the following options:
+This will show you what ids were present at that date.
+
+If you give it a time interval:
 ```sh
-./sem -hgd < data.txt
+./it "2023-04-01 2023-06-07" < data.txt
 ```
-you get a bigger result. Here's the last section of it:
-```
-* PAY 2022-08-18 quirinpa 3149 2022-06-23 2022-07-22 # comms
-|   2022-06-29 518400 652 leon
-|   2022-07-15 1382400 869 leon quirinpa
-|   2022-07-22 604800 761 quirinpa
-* PAY 2022-09-02 quirinpa 833 2022-07-20 2022-08-20 # gas
-|   2022-08-20 2678400 834 quirinpa
-* PAY 2022-09-02 quirinpa 4136 2022-07-27 2022-08-26 # light
-|   2022-08-26 2592000 4137 quirinpa
-* BUY 2022-09-06 quirinpa 853 # sonasol, bleach, sonasol wc, garbage bags
-|   427 quirinpa leon
-\
-*| RESUME 2022-09-11 leon
-|* PAY 2022-09-18 quirinpa 3149 2022-07-23 2022-08-22 # comms
-||   2022-08-22 2592000 3150 quirinpa
-\\
-*|| START 2022-09-18 tomas7
-\\\
-*||| START 2022-09-19 rafael
-leon owes quirinpa 58.45€
-tomas owes quirinpa 2.10€
-tomas owes leon 29.54€
-elias owes leon 23.55€
-vitor owes quirinpa 278.95€
-emad owes leon 108.86€
-```
+It will still show you which ids were present.
 
-But before you run the program, you need to understand the following section of this document.
+By the way, you can give it multiple arguments like that. Not just one.
 
-# Data format
-Each line in the text file consists of the following format:
-```
-<TYPE> <DATE> [...OTHERS]
-```
+If you give it the "-r" flag, it will only show you those that have always been present.
 
-There are the following TYPEs:
-
-```
-START - Participant begins renting a room
-PAUSE - Participant goes away temporarily
-RESUME - Participant returns from temporary leave
-STOP - Participant stops renting a room
-TRANSFER - Payment from one participant to another
-BUY - Shared goods are bought
-PAY - Bill is paid
-```
-
-Lines should always be appended at the end of the file. It is assumed that they are ordered by the first DATE expressed in the line.
-
+# Format
 
 All dates should be in UTC ISO-8601 format, like this: "2022-03-21T08:40:23".
 Optionally, we can have a date only, like "2022-02-01", this is assumed as "2022-01-31T24:00:00" or "2022-02-01T00:00:00".
@@ -92,46 +43,18 @@ Optionally, we can have a date only, like "2022-02-01", this is assumed as "2022
 
 Comments start with "#". It is assumed that the required items in the line are present before the "#", except in cases where there is a "#" at the start of a line.
 
-## Participant begins renting a room
+## Participant starts
 ```
-START <DATE> <PERSON_ID> [<PHONE_NUMBER> <EMAIL> ... <NAME>]
-```
-
-## Participant goes away temporarily
-```
-PAUSE <DATE> <PERSON_ID>
+START <DATE> <ID>
 ```
 
-## Participant returns from temporary leave
+## Participant stops
 ```
-RESUME <DATE> <PERSON_ID>
-```
-
-## Participant stops renting a room
-```
-STOP <DATE> <PERSON_ID>
-```
-
-## Payment from one participant to another
-```
-TRANSFER <DATE> <FROM_PERSON_ID> <TO_PERSON_ID> <AMOUNT>
-```
-
-## Shared goods are bought
-```
-BUY <DATE> <PERSON_ID> <AMOUNT> [DESCRIPTION]
-```
-
-## Bill is paid
-```
-PAY <DATE> <PERSON_ID> <AMOUNT> <START_DATE> <END_DATE> [<BILL_TYPE_ID> <ENTITY> <REFERENCE> ...]
+STOP <DATE> <ID>
 ```
 
 # Dependencies
 This program is dependant on libdb. On linux, it is also dependant on libbsd.
-
-# Payer's tip
-We check which people are present within a certain billing period, and split that billing period into sections with differing inhabitants. For each section in which a person is present, that person is going to pay a certain share of the cost of that section. Because we are using division, we always end up losing precision, for that reason, we use the number of cents, but we also have to add 1 cent to remedy the loss of this information. That is payer's tip.
 
 # Acknowledgements
 Leon, thanks for your help debugging the program and for putting up with me.

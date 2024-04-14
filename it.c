@@ -59,23 +59,22 @@
 #endif
 #include "common.h"
 
-#define ndebug(fmt, ...) \
-	if (pflags & PF_DEBUG) \
-		fprintf(stderr, fmt, ##__VA_ARGS__)
+#define DB_ITER(whodb) \
+	DBC *cur; \
+	DBT key, data; \
+	\
+	CBUG(whodb->cursor(whodb, NULL, &cur, 0)); \
+	\
+	memset(&key, 0, sizeof(DBT)); \
+	memset(&data, 0, sizeof(DBT)); \
+	\
+	while (1) \
+		if (cur->c_get(cur, &key, &data, DB_NEXT) == DB_NOTFOUND) { \
+			CBUG(cur->close(cur)); \
+			break; \
+		} else
 
-#define graph_head(id, flags) \
-	if (pflags & PF_GRAPH) \
-		who_graph_line(id, flags);
-
-#define debug(fmt, ...) \
-	if (pflags & PF_DEBUG) { \
-		graph_head(-1, 0); \
-		fprintf(stderr, fmt, ##__VA_ARGS__); \
-	}
-
-#define PAYER_TIP 1
 #define USERNAME_MAX_LEN 32
-#define CURRENCY_MAX_LEN 32
 
 struct ti {
 	time_t min, max;
@@ -88,13 +87,6 @@ struct isplit {
 	unsigned who;
 };
 
-struct who {
-	unsigned who;
-	SLIST_ENTRY(who) entry;
-};
-
-SLIST_HEAD(who_list, who);
-
 struct match {
 	struct ti ti;
 	STAILQ_ENTRY(match) entry;
@@ -105,8 +97,8 @@ STAILQ_HEAD(match_stailq, match);
 struct split {
 	time_t min;
 	time_t max;
-	size_t who_list_l;
-	struct who_list who_list;
+	DB *whodb;
+	size_t count;
 	TAILQ_ENTRY(split) entry;
 };
 
@@ -116,26 +108,15 @@ struct tidbs {
 	DB *ti; // keys and values are struct ti
 	DB *max; // secondary DB (BTREE) with interval max as key
 	DB *id; // secondary DB (BTREE) with ids as primary key
-} pdbs, npdbs;
+} pdbs;
 
 enum pflags {
-	PF_GRAPH = 1,
-	PF_DEBUG = 2,
-	PF_HUMAN = 4,
-	PF_MACHINE = 8,
-	PF_PRESENT = 16,
-	PF_QUIET = 32,
+	PF_STARTED = 1, // show participants even if they are not always present
+	PF_SPLIT = 2, // show splits when querying time intervals
 };
 
 DB *gdb = NULL; // graph primary DB (keys are usernames, values are user ids)
 DB *igdb = NULL; // secondary DB to lookup usernames via ids
-
-DB *gedb = NULL; // graph edge DB to lookup debt between participants (ids as key)
-
-DB *whodb = NULL; // temporary DB for process_pay(). see ti_split()
-
-DB *gwhodb = NULL; // DB for displaying timeline graph
-DB *gnpwhodb = NULL; // similar to the above except excludes pauses. Used for -p
 
 static DB_ENV *dbe = NULL;
 
@@ -143,95 +124,20 @@ unsigned g_len = 0;
 unsigned g_notfound = (unsigned) -1;
 unsigned pflags = 0;
 
-/* create a person that we can insert in the db of present people */
-static inline struct who *
-who_create(unsigned who)
-{
-	struct who *entry =
-		(struct who *) malloc(sizeof(struct who));
-
-	entry->who = who;
-	return entry;
+static int
+who_init(DB **whodb) {
+	return db_create(whodb, dbe, 0) \
+		|| gdb->open(*whodb, NULL, NULL, NULL, DB_HASH, DB_CREATE, 0664);
 }
 
 /* insert a list of present people into a split */
 static int
-who_list(DB *whodb, struct who_list *who)
+who_count(DB *whodb)
 {
-	DBC *cur;
-	DBT key, data;
-	int res;
 	int len = 0;
-
-	CBUG(whodb->cursor(whodb, NULL, &cur, 0));
-
-	memset(&key, 0, sizeof(DBT));
-	memset(&data, 0, sizeof(DBT));
-
-	while (1) {
-		struct who *entry;
-
-		res = cur->c_get(cur, &key, &data, DB_NEXT);
-
-		if (res == DB_NOTFOUND)
-			break;
-
-		CBUG(res);
-
-		entry = who_create(* (unsigned *) key.data);;
-		SLIST_INSERT_HEAD(who, entry, entry);
+	DB_ITER(whodb)
 		len++;
-	}
-
-	CBUG(cur->close(cur));
 	return len;
-}
-
-static inline void
-who_graph_line(unsigned who_does, unsigned flags) {
-	struct who_list whol;
-	struct who *who;
-	int len, did_id = 0;
-
-	SLIST_INIT(&whol);
-	len = who_list(gwhodb, &whol);
-
-	if (flags)
-		SLIST_FOREACH(who, &whol, entry) {
-			if (who_does == who->who) {
-				if (flags <= 2 || flags == 5)
-					fputc('*', stderr);
-			} else {
-				switch (flags) {
-				case 1:
-					fputc('|', stderr);
-					break;
-				case 2:
-					fputc('|', stderr);
-					break;
-				case 3:
-					if (who_does > who->who)
-						fputc('/', stderr);
-					else
-						fputc('|', stderr);
-					break;
-				case 4:
-					if (who_does > who->who)
-						fputc('\\', stderr);
-					else
-						fputc('|', stderr);
-					break;
-				case 5:
-					fputc('|', stderr);
-					break;
-				}
-			}
-		}
-	else
-		SLIST_FOREACH(who, &whol, entry)
-			fputc('|', stderr);
-
-	fputc(' ', stderr);
 }
 
 /******
@@ -240,7 +146,7 @@ who_graph_line(unsigned who_does, unsigned flags) {
 
 static unsigned g_find(char *name);
 
-/* read person nickname and convert it to existing numeric id */
+/* read id and convert it to existing numeric id */
 static size_t
 read_id(unsigned *id, char *line)
 {
@@ -249,22 +155,8 @@ read_id(unsigned *id, char *line)
 
 	ret = read_word(username, line, sizeof(username));
 	*id = g_find(username);
-	CBUG(*id == g_notfound);
 
 	return ret;
-}
-
-/* read currency value and convert it to int */
-static size_t
-read_currency(long *target, char *line)
-{
-	char buf[CURRENCY_MAX_LEN];
-	size_t len;
-
-	len = read_word(buf, line, sizeof(buf));
-	*target = (long) (strtof(buf, NULL) * 100.0f);
-
-	return len;
 }
 
 /******
@@ -367,20 +259,7 @@ dbs_init()
 		|| igdb->open(igdb, NULL, NULL, NULL, DB_HASH, DB_CREATE, 0664)
 		|| gdb->associate(gdb, NULL, igdb, map_gdb_igdb, DB_CREATE)
 
-		|| db_create(&gedb, dbe, 0)
-		|| gedb->open(gedb, NULL, NULL, NULL, DB_HASH, DB_CREATE, 0664)
-
-		|| tidbs_init(&pdbs)
-		|| tidbs_init(&npdbs)
-
-		|| db_create(&whodb, dbe, 0)
-		|| gdb->open(whodb, NULL, NULL, NULL, DB_HASH, DB_CREATE, 0664)
-
-		|| db_create(&gwhodb, dbe, 0)
-		|| gdb->open(gwhodb, NULL, NULL, NULL, DB_BTREE, DB_CREATE, 0664)
-
-		|| db_create(&gnpwhodb, dbe, 0)
-		|| gdb->open(gnpwhodb, NULL, NULL, NULL, DB_HASH, DB_CREATE, 0664);
+		|| tidbs_init(&pdbs);
 
 	CBUG(ret);
 }
@@ -404,7 +283,6 @@ g_insert(char *name)
 	data.size = sizeof(g_len);
 
 	CBUG(gdb->put(gdb, NULL, &key, &data, 0));
-	/* debug("g_insert %s id %u\n", name, g_len); */
 	return g_len++;
 }
 
@@ -452,125 +330,6 @@ gi_get(unsigned id)
 
 	CBUG(igdb->pget(igdb, NULL, &key, &pkey, &data, 0));
 	return pkey.data;
-}
-
-/******
- * ge (graph edges) functions
- ******/
-
-/* get debt between people */
-static long
-ge_get(unsigned id0, unsigned id1)
-{
-	unsigned ids[2];
-	DBT key, data;
-	long ret;
-
-	memset(&key, 0, sizeof(DBT));
-	memset(&data, 0, sizeof(DBT));
-
-	if (id0 > id1) {
-		ids[0] = id1;
-		ids[1] = id0;
-	} else {
-		ids[0] = id0;
-		ids[1] = id1;
-	}
-
-	key.data = ids;
-	key.size = sizeof(ids);
-	ret = gedb->get(gedb, NULL, &key, &data, 0);
-
-	if (ret == DB_NOTFOUND)
-		return 0;
-
-	CBUG(ret);
-	ret = * (long *) data.data;
-	return id0 > id1 ? -ret : ret;
-}
-
-/* add debt between people */
-static void
-ge_add(unsigned id_from, unsigned id_to, long value)
-{
-	unsigned ids[2];
-	DBT key, data;
-	long cvalue;
-
-	memset(&key, 0, sizeof(DBT));
-	memset(&data, 0, sizeof(DBT));
-
-	if (id_from > id_to) {
-		ids[0] = id_to;
-		ids[1] = id_from;
-	} else {
-		ids[0] = id_from;
-		ids[1] = id_to;
-	}
-
-	key.data = ids;
-	key.size = sizeof(ids);
-
-	cvalue = ge_get(id_from, id_to);
-
-	if (id_from > id_to)
-		value = - cvalue - value;
-	else
-		value = cvalue + value;
-
-	data.data = &value;
-	data.size = sizeof(value);
-
-	CBUG(gedb->put(gedb, NULL, &key, &data, 0));
-}
-
-/* show debt between a pair of two people */
-static inline void
-ge_show(unsigned from, unsigned to, long value)
-{
-	char *from_name_i = gi_get(from),
-	     from_name[USERNAME_MAX_LEN];
-	char *to_name;
-	memcpy(from_name, from_name_i, strlen(from_name_i) + 1);
-	to_name = gi_get(to);
-
-	if (value > 0)
-		printf("%s owes %s %.2f€\n", to_name, from_name,
-				((float) value) / 100.0f);
-	else
-		printf("%s owes %s %.2f€\n", from_name, to_name,
-				- ((float) value) / 100.0f);
-}
-
-/* show all debt between people */
-static void
-ge_show_all()
-{
-	DBC *cur;
-	DBT key, data;
-	int ret;
-
-	CBUG(gedb->cursor(gedb, NULL, &cur, 0));
-
-	memset(&data, 0, sizeof(DBT));
-	memset(&key, 0, sizeof(DBT));
-
-	while (1) {
-		long value;
-
-		ret = cur->get(cur, &key, &data, DB_NEXT);
-
-		if (ret == DB_NOTFOUND)
-			return;
-
-		CBUG(ret);
-		value = * (unsigned long *) data.data;
-		if (value)
-			ge_show(* (unsigned *) key.data,
-					((unsigned *) key.data)[1], value);
-	}
-
-	CBUG(cur->close(cur));
 }
 
 /******
@@ -654,23 +413,6 @@ who_get(DB *whodb, unsigned who) {
 	}
 }
 
-static inline void
-who_present() {
-	struct who_list whol;
-	struct who *who;
-	int len, did_id = 0;
-
-	SLIST_INIT(&whol);
-	len = who_list(gnpwhodb , &whol);
-
-	SLIST_FOREACH(who, &whol, entry)
-		printf("%c %s\n",
-		       who_get(gwhodb, who->who) ? 'P' : 'A',
-		       gi_get(who->who));
-
-	// TODO free list?
-}
-
 /******
  * ti (struct ti to struct ti primary db) related functions
  ******/
@@ -691,8 +433,6 @@ ti_insert(struct tidbs *dbs, unsigned id, time_t start, time_t end)
 	data.size = sizeof(ti);
 
 	CBUG(dbs->ti->put(dbs->ti, NULL, &key, &data, 0));
-
-	/* debug("ti_insert %u [%s, %s]\n", id, printtime(start), printtime(end)); */
 }
 
 /* finish the last found interval at the provided timestamp for a certain
@@ -715,18 +455,13 @@ ti_finish_last(struct tidbs *dbs, unsigned id, time_t end)
 	key.data = &id;
 	key.size = sizeof(id);
 
-	/* debug("ti_finish_last %d", id); */
-
 	do {
 		CBUG(cur->c_get(cur, &key, &data, dbflags)); // even DB_NOTFOUND
-		/* ndebug(" %d", * (unsigned *) key.data); */
 		CBUG(* (unsigned *) key.data != id);
 		memcpy(&ti, data.data, sizeof(ti));
 		dbflags = DB_NEXT;
-		/* ndebug("(" TS_FMT "," TS_FMT ")", ti.min, ti.max); */
 	} while (ti.max != tinf);
 
-	/* ndebug("\n"); */
 	CBUG(cur->del(cur, 0));
 	cur->close(cur);
 	memset(&key, 0, sizeof(DBT));
@@ -737,8 +472,6 @@ ti_finish_last(struct tidbs *dbs, unsigned id, time_t end)
 	data.data = &ti;
 	data.size = sizeof(ti);
 	CBUG(dbs->ti->put(dbs->ti, NULL, &key, &data, 0));
-	/* debug("ti_finish_last %u [%s, %s]\n", */
-	/* 		ti.who, printtime(ti.min), printtime(ti.max)); */
 }
 
 /* intersect an interval with an AVL of intervals */
@@ -793,20 +526,6 @@ ti_pintersect(struct tidbs *dbs, struct match_stailq *matches, time_t ts)
 /******
  * matches related functions
  ******/
-
-/* debugs an array of matches */
-static void
-matches_debug(struct match_stailq *matches)
-{
-	struct match *match;
-	int i;
-	graph_head(-1, 0);
-	fprintf(stderr, "matches_debug");
-	STAILQ_FOREACH(match, matches, entry) {
-		fprintf(stderr, " (%s, " TS_FMT ", " TS_FMT ")", gi_get(match->ti.who), match->ti.min, match->ti.max);
-	}
-	fputc('\n', stderr);
-}
 
 /* makes all provided matches lie within the provided interval [min, max] */
 static inline void
@@ -899,13 +618,14 @@ isplits_debug(struct isplit *isplits, unsigned matches_l) {
 /* Creates one split from its interval, and the list of people that are present
  */
 static inline struct split *
-split_create(time_t min, time_t max)
+split_create(DB *whodb, time_t min, time_t max)
 {
 	struct split *split = (struct split *) malloc(sizeof(struct split));
 	split->min = min;
 	split->max = max;
-	SLIST_INIT(&split->who_list);
-	split->who_list_l = who_list(whodb, &split->who_list);
+	who_init(&split->whodb);
+	split->count = who_count(split->whodb);
+	{ DB_ITER(whodb) who_insert(split->whodb, * (unsigned *) key.data); }
 	return split;
 }
 
@@ -916,11 +636,12 @@ splits_create(
 		struct isplit *isplits,
 		size_t matches_l)
 {
+	DB *whodb = NULL;
 	int i;
 
 	TAILQ_INIT(splits);
 
-	who_drop(whodb);
+	who_init(&whodb);
 	for (i = 0; i < matches_l * 2 - 1; i++) {
 		struct isplit *isplit = isplits + i;
 		struct isplit *isplit2 = isplits + i + 1;
@@ -938,29 +659,10 @@ splits_create(
 		if (n == m)
 			continue;
 
-		split = split_create(n, m);
+		split = split_create(whodb, n, m);
 		TAILQ_INSERT_TAIL(splits, split, entry);
 	}
-}
-
-/* Just something to debug a tail queue of splits */
-static inline void
-splits_debug(struct split_tailq *splits)
-{
-	struct split *split;
-
-	graph_head(-1, 0);
-	fprintf(stderr, "splits_debug ");
-	TAILQ_FOREACH(split, splits, entry) {
-		struct who *who, *tmp;
-		fprintf(stderr, "(" TS_FMT ", " TS_FMT ", { ", split->min, split->max);
-
-		SLIST_FOREACH_SAFE(who, &split->who_list, entry, tmp)
-			fprintf(stderr, "%s ", gi_get(who->who));
-
-		fprintf(stderr, "}) ");
-	}
-	fprintf(stderr, "\n");
+	whodb->close(whodb, 0);
 }
 
 /* From a list of matched intervals, this creates the tail queue of splits
@@ -989,9 +691,7 @@ splits_get(struct split_tailq *splits, struct tidbs *dbs, time_t min, time_t max
 {
 	struct match_stailq matches;
 	unsigned matches_l = ti_intersect(dbs, &matches, min, max);
-	/* matches_debug(&matches); */
 	matches_fix(&matches, min, max);
-	/* matches_debug(&matches); */
 	splits_init(splits, &matches, matches_l);
 	matches_free(&matches);
 }
@@ -1024,7 +724,7 @@ splits_fill(struct split_tailq *splits, time_t min, time_t max)
 
 	split = TAILQ_FIRST(splits);
 	if (!split) {
-		splits_get(splits, &npdbs, min, max);
+		splits_get(splits, &pdbs, min, max);
 		return;
 	}
 
@@ -1032,16 +732,16 @@ splits_fill(struct split_tailq *splits, time_t min, time_t max)
 
 	if (split->min > last_max) {
 		struct split_tailq more_splits;
-		splits_get(&more_splits, &npdbs, last_max, split->min);
+		splits_get(&more_splits, &pdbs, last_max, split->min);
 		splits_concat_before(splits, &more_splits, split);
 	}
 
 	last_max = split->max;
 
 	TAILQ_FOREACH_SAFE(split, splits, entry, tmp) {
-		if (!split->who_list_l) {
+		if (!split->count) {
 			struct split_tailq more_splits;
-			splits_get(&more_splits, &npdbs, split->min, split->max);
+			splits_get(&more_splits, &pdbs, split->min, split->max);
 			splits_concat_before(splits, &more_splits, split);
 			TAILQ_REMOVE(splits, split, entry);
 		}
@@ -1051,50 +751,25 @@ splits_fill(struct split_tailq *splits, time_t min, time_t max)
 
 	if (max > last_max) {
 		struct split_tailq more_splits;
-		splits_get(&more_splits, &npdbs, last_max, max);
+		splits_get(&more_splits, &pdbs, last_max, max);
 		TAILQ_CONCAT(splits, &more_splits, entry);
 	}
-}
-
-static inline long
-pay(long long divident, long long divisor) {
-	return (divident % divisor ? PAYER_TIP : 0)
-		+ divident / divisor;
 }
 
 /* adds debt for each person of the tail queue of splits to the payer of the
  * bill
  */
 static inline void
-splits_pay(
-		struct split_tailq *splits, unsigned payer,
-		long value, time_t bill_interval)
+splits_print(struct split_tailq *splits)
 {
 	struct split *split;
 
 	TAILQ_FOREACH(split, splits, entry) {
-		struct who *who;
 		time_t interval = split->max - split->min;
-		int cost = pay(interval * value, split->who_list_l * bill_interval);
-		if (pflags & PF_DEBUG) {
-			graph_head(-1, 0);
-			if (pflags & PF_HUMAN) {
-				char *smaxs = printtime(split->max);
-				if (pflags & PF_MACHINE)
-					fprintf(stderr, "  " TS_FMT ":%s " TS_FMT " %d", split->max, smaxs, interval, cost);
-				else
-					fprintf(stderr, "  %s " TS_FMT " %d", smaxs, interval, cost);
-				free(smaxs);
-			} else
-				fprintf(stderr, "  " TS_FMT " " TS_FMT " %d", split->max, interval, cost);
-		}
-
-		SLIST_FOREACH(who, &split->who_list, entry) {
-			if (who->who != payer)
-				ge_add(payer, who->who, cost);
-			ndebug(" %s", gi_get(who->who));
-		}
-		ndebug("\n");
+		printf("%ld", interval);
+		DB_ITER(split->whodb)
+			printf(" %s", gi_get(* (unsigned *) key.data));
+		printf("\n");
 	}
 }
 
@@ -1105,13 +780,7 @@ splits_free(struct split_tailq *splits)
 	struct split *split, *split_tmp;
 
 	TAILQ_FOREACH_SAFE(split, splits, entry, split_tmp) {
-		struct who *who, *who_tmp;
-
-		SLIST_FOREACH_SAFE(who, &split->who_list, entry, who_tmp) {
-			SLIST_REMOVE(&split->who_list, who, who, entry);
-			free(who);
-		}
-
+		split->whodb->close(split->whodb, 0);
 		TAILQ_REMOVE(splits, split, entry);
 		free(split);
 	}
@@ -1133,177 +802,6 @@ line_finish(char *line)
  * functions that process a valid type of line
  ******/
 
-// https://softwareengineering.stackexchange.com/questions/363091/split-overlapping-ranges-into-all-unique-ranges/363096#363096
-
-/* This function is for handling lines in the format:
- *
- * PAY <DATE> <PERSON_ID> <AMOUNT> <START_DATE> <END_DATE> [...]
- *
- * It represents the act of paying a bill. It reads the id of the payer, a
- * monetary value, the start date and the end date for the billing period.
- * Then it fetches the intervals of BST A which match this time period, and it
- * "trims" them so that they lie only within it. After this, it splits the
- * billing period into sections (or splits) where the number of people present
- * differ. For a more visual representation of what is going on:
- *       l
- * o------------o - - - - - - - - - - - - -o
- *       el
- * o---------------------------------------o
- *       q
- * o---------------------------------------o
- * 
- * o------------o--------------------------o
- * x            w                          y
- *
- * For the billing period [x, y], we get the intervals:
- *
- * ([x, w], l), ([x, y], el), ([x, y], q).
- *
- * From this we construct the following splits:
- *
- * ([x, w], { l, el, q }), ([w, y], { el, q })
- *
- * There is also the possibility that there are periods of time that no one is
- * present, and this is also handled here. If no one is present but they are
- * still renting a room there, we introduce splits with the intervals from
- * BST B in the available gaps.
- *
- * From the obtained "splits" we then proceed to calculate how much each person
- * has to pay. Suppose the amount of the bill is A, and we have the splits
- * described above. For the first split, the amount per person would be:
- * PAYER_TIP + (w - x) * A / (y - x) * 3, and for the second:
- * PAYER_TIP + (y - w) * A / (y - x) * 2.
- *
- * I will spare you the gory details for now, but you can check out the
- * functions above.
- */
-static inline void
-process_pay(time_t ts, char *line)
-{
-	struct split_tailq splits;
-	unsigned id;
-	long value;
-	time_t min, max;
-
-	line += read_id(&id, line);
-	line += read_currency(&value, line);
-	line += read_ts(&min, line);
-	line += read_ts(&max, line);
-	if (pflags & (PF_GRAPH | PF_DEBUG)) {
-		graph_head(id, 5);
-		if (pflags & PF_HUMAN) {
-			char *tss = printtime(ts), *mins = printtime(min), *maxs = printtime(max);
-			if (pflags & PF_MACHINE)
-				fprintf(stderr, TS_FMT ":%s PAY %s %ld " TS_FMT ":%s " TS_FMT ":%s", ts, tss, gi_get(id), value, min, mins, max, maxs);
-			else
-				fprintf(stderr, "PAY %s %s %ld %s %s", tss, gi_get(id), value, mins, maxs);
-			free(tss);
-			free(mins);
-			free(maxs);
-		} else
-			fprintf(stderr, TS_FMT " PAY %s %ld " TS_FMT " " TS_FMT "", ts, gi_get(id), value, min, max);
-		line_finish(line);
-	}
-
-	splits_get(&splits, &pdbs, min, max);
-	splits_fill(&splits, min, max);
-	/* splits_debug(&splits); */
-	splits_pay(&splits, id, value, max - min);
-	splits_free(&splits);
-}
-
-/* This function is for handling lines in the format:
- *
- * BUY <DATE> <PERSON_ID> <AMOUNT> [DESCRIPTION]
- *
- * It reads an existing id much like process_resume, and it also reads a
- * currency value. Then it sees which time intervals in BST B intersect with
- * the provided DATE. Then it divides the value by the number of matches it
- * got, and it adds PAYER_TIP to the result, which was added to make sure the
- * payer of the bill or of the shared goods does not lose money with rounding
- * errors. After this, it iterates over all the matches, adding the result
- * money owed to the read id (the payer), from the person that interval
- * belongs to.
- */
-static inline void
-process_buy(time_t ts, char *line)
-{
-	struct match_stailq matches;
-	struct match *match;
-	unsigned id;
-	int i;
-	long value, dvalue;
-
-	line += read_id(&id, line);
-	line += read_currency(&value, line);
-	if (pflags & (PF_GRAPH | PF_DEBUG)) {
-		graph_head(id, 5);
-		if (pflags & PF_HUMAN) {
-			char *tss = printtime(ts);
-			if (pflags & PF_MACHINE)
-				fprintf(stderr, TS_FMT ":%s BUY %s %ld", ts, tss, gi_get(id), value);
-			else
-				fprintf(stderr, "BUY %s %s %ld", tss, gi_get(id), value);
-			free(tss);
-		} else
-			fprintf(stderr, TS_FMT " BUY %s %ld", ts, gi_get(id), value);
-		line_finish(line);
-	}
-
-	unsigned matches_l = ti_pintersect(&npdbs, &matches, ts);
-	dvalue = pay(value, matches_l);
-
-	debug("  %ld", dvalue);
-
-	// assert there are not multiple intervals with the same id?
-	STAILQ_FOREACH(match, &matches, entry) {
-		if (match->ti.who != id)
-			ge_add(id, match->ti.who, dvalue);
-		ndebug(" %s", gi_get(match->ti.who));
-	}
-
-	ndebug("\n");
-}
-
-/* This function is for handling lines in the format:
- *
- * TRANSFER <DATE> <FROM_PERSON_ID> <TO_PERSON_ID> <AMOUNT>
- *
- * It reads two existing PERSON_IDs and obtains their numeric ids, which are
- * assumed to exist. It also reads a currency value. Then it adds the value to
- * the edge between the first id and the second id, increasing the debt that
- * the second person owes to the first one by that value.
- */
-static inline void
-process_transfer(time_t ts, char *line)
-{
-	unsigned id_from, id_to;
-	long value;
-
-	line += read_id(&id_from, line);
-	line += read_id(&id_to, line);
-	line += read_currency(&value, line);
-
-	if (pflags & (PF_GRAPH | PF_DEBUG)) {
-		char *id_from_si = gi_get(id_from);
-		char id_from_s[USERNAME_MAX_LEN];
-		memcpy(id_from_s, id_from_si, strlen(id_from_si) + 1);
-		graph_head(id_from, 5);
-		if (pflags & PF_HUMAN) {
-			char *tss = printtime(ts);
-			if (pflags & PF_MACHINE)
-				fprintf(stderr, TS_FMT ":%s TRANSFER %s %s %ld", ts, tss, id_from_s, gi_get(id_to), value);
-			else
-				fprintf(stderr, "TRANSFER %s %s %s %ld", tss, id_from_s, gi_get(id_to), value);
-			free(tss);
-		} else
-			fprintf(stderr, TS_FMT " TRANSFER %s %s %ld", ts, id_from_s, gi_get(id_to), value);
-		line_finish(line);
-	}
-
-	ge_add(id_from, id_to, value);
-}
-
 /* This function is for handling lines in the format:
  *
  * STOP <DATE> <PERSON_ID>
@@ -1323,118 +821,13 @@ process_stop(time_t ts, char *line)
 
 	line += read_word(username, line, sizeof(username));
 	id = g_find(username);
-	if (pflags & (PF_GRAPH | PF_DEBUG)) {
-		graph_head(id, 1);
-		if (pflags & PF_HUMAN) {
-			char *tss = printtime(ts);
-			if (pflags & PF_MACHINE)
-				fprintf(stderr, TS_FMT ":%s STOP %s", ts, tss, gi_get(id));
-			else
-				fprintf(stderr, "STOP %s %s", tss, gi_get(id));
-			free(tss);
-		} else
-			fprintf(stderr, TS_FMT " STOP %s", ts, gi_get(id));
-		line_finish(line);
-		if (pflags & PF_GRAPH) {
-			graph_head(id, 3); fputc('\n', stderr);
-		}
-	}
-	who_remove(gwhodb, id);
-	who_remove(gnpwhodb, id);
 
-	if (id != g_notfound) {
+	if (id != g_notfound)
 		ti_finish_last(&pdbs, id, ts);
-		ti_finish_last(&npdbs, id, ts);
-	} else {
+	else {
 		id = g_insert(username);
 		ti_insert(&pdbs, id, mtinf, ts);
-		ti_insert(&npdbs, id, mtinf, ts);
 	}
-}
-
-/* This function is for handling lines in the format:
- *
- * RESUME <DATE> <PERSON_ID>
- *
- * So it reads an existing PERSON_ID and obtains the correspondant numeric id,
- * then it inserts the interval [DATE, +∞] (and the id) into BST A. It differs
- * from process_start in the sense that it assumes that the numeric id is
- * already present, and also because it never inserts the interval into BST B.
- */
-static inline void
-process_resume(time_t ts, char *line)
-{
-	unsigned id;
-
-	line += read_id(&id, line);
-	CBUG(who_get(gwhodb, id));
-	CBUG(!who_get(gnpwhodb, id));
-	who_insert(gwhodb, id);
-	if (pflags & (PF_GRAPH | PF_DEBUG)) {
-		if (pflags & PF_GRAPH) {
-			graph_head(id, 4); fputc('\n', stderr);
-		}
-		graph_head(id, 2);
-		if (pflags & PF_HUMAN) {
-			char *tss = printtime(ts);
-			if (pflags & PF_MACHINE)
-				fprintf(stderr, TS_FMT ":%s RESUME %s", ts, tss, gi_get(id));
-			else
-				fprintf(stderr, "RESUME %s %s", tss, gi_get(id));
-			free(tss);
-		} else
-			fprintf(stderr, TS_FMT " RESUME %s", ts, gi_get(id));
-		line_finish(line);
-	}
-	// TODO assert no interval for id at this ts
-	ti_insert(&pdbs, id, ts, tinf);
-}
-
-/* This function is for handling lines in the format:
- *
- * PAUSE <DATE> <PERSON_ID>
- *
- * As such, it reads an existing PERSON_ID, and fetches the numeric id to which
- * it corresponds. After that, it grabs the last time interval that is present
- * that belongs to that person, and finishes it at the read DATE
- * (only in BST A).
- *
- * For example, if the preceding line was:
- *
- * START <DATE_A> joseph
- *
- * And therefore, the most recent interval for joseph was [DATE_A, +∞], a line
- * like:
- *
- * PAUSE <DATE_B> joseph
- *
- * Would update this interval to [DATE_A, DATE_B], but only for BST A.
- */
-static inline void
-process_pause(time_t ts, char *line)
-{
-	unsigned id;
-
-	line += read_id(&id, line);
-	if (pflags & (PF_GRAPH | PF_DEBUG)) {
-		graph_head(id, 1);
-		if (pflags & PF_HUMAN) {
-			char *tss = printtime(ts);
-			if (pflags & PF_MACHINE)
-				fprintf(stderr, TS_FMT ":%s PAUSE %s", ts, tss, gi_get(id));
-			else
-				fprintf(stderr, "PAUSE %s %s", tss, gi_get(id));
-			free(tss);
-		} else
-			fprintf(stderr, TS_FMT " PAUSE %s", ts, gi_get(id));
-		line_finish(line);
-		if (pflags & PF_GRAPH) {
-			graph_head(id, 3); fputc('\n', stderr);
-		}
-	}
-	who_remove(gwhodb, id);
-	// TODO assert interval for id at this ts
-	ti_finish_last(&pdbs, id, ts);
 }
 
 /* This function is for handling lines in the format:
@@ -1452,27 +845,10 @@ process_start(time_t ts, char *line)
 	unsigned id;
 
 	line += read_word(username, line, sizeof(username));
-	id = g_insert(username);
-	who_insert(gwhodb, id);
-	who_insert(gnpwhodb, id);
-	if (pflags & (PF_GRAPH | PF_DEBUG)) {
-		if (pflags & PF_GRAPH) {
-			graph_head(id, 4); fputc('\n', stderr);
-		}
-		graph_head(id, 2);
-		if (pflags & PF_HUMAN) {
-			char *tss = printtime(ts);
-			if (pflags & PF_MACHINE)
-				fprintf(stderr, TS_FMT ":%s START %s", ts, tss, gi_get(id));
-			else
-				fprintf(stderr, "START %s %s", tss, gi_get(id));
-			free(tss);
-		} else
-			fprintf(stderr, TS_FMT " START %s", ts, gi_get(id));
-		line_finish(line);
-	}
+	id = g_find(username);
+	if (id == g_notfound)
+		id = g_insert(username);
 	ti_insert(&pdbs, id, ts, tinf);
-	ti_insert(&npdbs, id, ts, tinf);
 }
 
 /******
@@ -1501,7 +877,6 @@ process_line(char *line)
 	if (line[0] == '#' || line[0] == '\n')
 		return;
 
-	/* debug("%s", line); */
 	line += read_word(op_type_str, line, sizeof(op_type_str));
 	line += read_ts(&ts, line);
 
@@ -1515,49 +890,27 @@ process_line(char *line)
 			return process_start(ts, line);
 		case 'O':
 			return process_stop(ts, line);
-		default:
-			goto error;
 		}
-	case 'T':
-		return process_transfer(ts, line);
-	case 'P':
-		if (op_type_str[1] != 'A')
-			goto error;
-
-		switch (op_type_str[2]) {
-		case 'Y':
-			return process_pay(ts, line);
-		case 'U':
-			return process_pause(ts, line);
-		default:
-			goto error;
-		}
-	case 'R':
-		return process_resume(ts, line);
-	case 'B':
-		return process_buy(ts, line);
 	}
 
 error:
-	err(EXIT_FAILURE, "Invalid format");
+	/* err(EXIT_FAILURE, "Invalid format"); */
 }
 
 static inline void
 usage(char *prog)
 {
-	fprintf(stderr, "Usage: %s [-gdhm]", prog);
+	fprintf(stderr, "Usage: %s [-rs]", prog);
 	fprintf(stderr, "    Options:\n");
-	fprintf(stderr, "        -g        display graph.\n");
-	fprintf(stderr, "        -d        display debug messages.\n");
-	fprintf(stderr, "        -h        display dates in ISO 8601 format.\n");
-	fprintf(stderr, "        -m        display dates in both unix timestamp and ISO 8601 formats.\n");
+	fprintf(stderr, "        -r        Only always present.\n");
+	fprintf(stderr, "        -s        Show splits.\n");
 }
 
 /* The main function is the entry point to the application. In this case, it
  * is very basic. What it does is it reads each line that was fed in standard
  * input. This allows you to feed it any file you want by running:
  *
- * $ cat file.txt | ./sem
+ * $ cat file.txt | ./it "2022-03-01 2022-05-15T10:00:00" "now" "2023-11-18"
  *
  * You can also just run "./sem", input manually, and then hit ctrl+D.
  *
@@ -1577,32 +930,14 @@ main(int argc, char *argv[])
 	int ret;
 	char c;
 
-	while ((c = getopt(argc, argv, "gdhmpq")) != -1) {
+	while ((c = getopt(argc, argv, "rs")) != -1) {
 		switch (c) {
-		case 'd':
-			pflags |= PF_DEBUG;
+		case 'r':
+			pflags |= PF_STARTED;
 			break;
-
-		case 'g':
-			pflags |= PF_GRAPH;
+		case 's':
+			pflags |= PF_SPLIT;
 			break;
-			
-		case 'h':
-			pflags |= PF_HUMAN;
-			break;
-
-		case 'm':
-			pflags |= PF_MACHINE | PF_HUMAN;
-			break;
-
-		case 'p':
-			pflags |= PF_PRESENT;
-			break;
-
-		case 'q':
-			pflags |= PF_QUIET;
-			break;
-			
 		default:
 			usage(*argv);
 			return 1;
@@ -1620,13 +955,70 @@ main(int argc, char *argv[])
 
 	free(line);
 
-	if (pflags & PF_QUIET)
-		return EXIT_SUCCESS;
+	// for each fed string, present the intersection
+	while (optind < argc) {
+		char *arg = argv[optind++], *space;
+		time_t min;
+		printf("# %s\n", arg);
+		space = strchr(arg, ' ');
+		arg += read_ts(&min, arg);
+		if (space) {
+			// https://softwareengineering.stackexchange.com/questions/363091/split-overlapping-ranges-into-all-unique-ranges/363096#363096
 
-	if (pflags & PF_PRESENT)
-		who_present();
-	else
-		ge_show_all();
+			time_t max;
+			struct split_tailq splits;
+			struct split *split;
+			unsigned id;
+
+			read_ts(&max, arg);
+
+			splits_get(&splits, &pdbs, min, max);
+			splits_fill(&splits, min, max);
+			if (pflags & PF_SPLIT) TAILQ_FOREACH(split, &splits, entry) {
+				time_t interval = split->max - split->min;
+				printf("%ld", interval);
+				DB_ITER(split->whodb)
+					printf(" %s", gi_get(* (unsigned *) key.data));
+				printf("\n");
+			} else {
+				DB *whodb = NULL;
+				who_init(&whodb);
+
+				TAILQ_FOREACH(split, &splits, entry) {
+					DB_ITER(split->whodb) {
+						unsigned who = * (unsigned *) key.data;
+						if (!who_get(whodb, who))
+							who_insert(whodb, who);
+					}
+				}
+
+				if (pflags & PF_STARTED) TAILQ_FOREACH(split, &splits, entry) {
+					DB_ITER(whodb) {
+						 unsigned who = * (unsigned *) key.data;
+						 if (!who_get(split->whodb, who))
+							who_remove(whodb, who);
+					 }
+				}
+
+				DB_ITER(whodb) {
+					unsigned who = * (unsigned *) key.data;
+					printf("%s\n", gi_get(who));
+				}
+
+				whodb->close(whodb, 0);
+			}
+			splits_free(&splits);
+		} else {
+			struct match_stailq matches;
+			struct match *match, *match_tmp;
+			unsigned matches_l = ti_intersect(&pdbs, &matches, min, min);
+			STAILQ_FOREACH_SAFE(match, &matches, entry, match_tmp) {
+				printf("%s\n", gi_get(match->ti.who));
+				STAILQ_REMOVE_HEAD(&matches, entry);
+				free(match);
+			}
+		}
+	}
 
 	return EXIT_SUCCESS;
 }

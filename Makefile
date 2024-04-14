@@ -6,22 +6,23 @@ LD=gcc
 
 LIBDB_PATH ?= /usr/lib
 CFLAGS-Alpine := -DALPINE
+EXE := it
 
 CFLAGS += ${CFLAGS-${DISTRO}} -I/usr/local/include -I/usr/include
 LDFLAGS += ${LDFLAGS-${UNAME}} -L/usr/local/lib -L/usr/lib -ldb
 
-all: sem sem-echo
+all: ${EXE} ${EXE}-echo
 
-sem: sem.c
+${EXE}: ${EXE}.c
 	${LD} -o $@ $^ ${LDFLAGS}
-	# ${LINK.c} -g -o $@ sem.c ${LIBFILES-${UNAME}}
+	# ${LINK.c} -g -o $@ ${EXE}.c ${LIBFILES-${UNAME}}
 
-sem-echo: sem-echo.c
+${EXE}-echo: ${EXE}-echo.c
 	${LD} -o $@ $^ ${LDFLAGS}
-	# ${LINK.c} -g -o $@ sem-echo.c ${LIBFILES-${UNAME}}
+	# ${LINK.c} -g -o $@ ${EXE}-echo.c ${LIBFILES-${UNAME}}
 
-run: sem
-	cat data.txt | ./sem
+run: ${EXE}
+	cat data.txt | ./${EXE}
 
 clean:
-	rm sem
+	rm ${EXE}
