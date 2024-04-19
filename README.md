@@ -2,43 +2,52 @@
 This is based on [sem](https://github.com/quirinpa/sem). It is a tool for searching through an interval tree.
 Meaning you can provide (START and STOP) events with corresponding ids, and you can search which ids were present at a given moment
 
-# Building
-Here's how to build on Alpine Linux:
-```sh
-make ALPINE=y
-```
-To build on other distributions you might have to provide "LIBDB\_PATH" in case the default doesn't work for you. Here's an example:
-```sh
-make LIBDB_PATH=$LIBDB_PATH
-```
-To build on OpenBSD, just "make" will be enough.
-
 # Running
-You can:
+Run itd (the daemon program):
 ```sh
-./it -?
+sudo mkdir /var/lib/it
+sudo ./itd
 ```
-To find out about the available options.
-Otherwise, feed a file to sem:
-```sh
-./it "2023-04-01" < data.txt
-```
-This will show you what ids were present at that date.
 
-If you give it a time interval:
+You can feed input to it:
 ```sh
-./it "2023-04-01 2023-06-07" < data.txt
+cat sample.txt | ./it "2023-01-01"
 ```
-It will still show you which ids were present.
+
+And then just run it as:
+```sh
+./it "2023-01-01 2024-01-01"
+```
+This will show you what ids were present in that slice of time.
 
 By the way, you can give it multiple arguments like that. Not just one.
 
-If you give it the "-r" flag, it will only show you those that have always been present.
+# Flags
+## itd
+### -d
+> detach
+### -f FILENAME
+> change default db filename
+### -C DB\_HOME
+> change default DB\_HOME (from "/var/lib/it")
+### -S SOCK\_PATH
+> change default SOCK\_PATH (from "/tmp/it-sock")
+## it
+### -S SOCK\_PATH
+> change default SOCK\_PATH (from "/tmp/it-sock")
+### -r QUERY
+> query participants which are there the entire time
+### -s QUERY
+> get split information
+### QUERY
+> query participants
 
-# Format
+# Input Format
 
 All dates should be in UTC ISO-8601 format, like this: "2022-03-21T08:40:23".
 Optionally, we can have a date only, like "2022-02-01", this is assumed as "2022-01-31T24:00:00" or "2022-02-01T00:00:00".
+
+Or, we can use long (or long long) signed integers.
 
 
 Comments start with "#". It is assumed that the required items in the line are present before the "#", except in cases where there is a "#" at the start of a line.
@@ -53,8 +62,22 @@ START <DATE> <ID>
 STOP <DATE> <ID>
 ```
 
-# Dependencies
-This program is dependant on libdb. On linux, it is also dependant on libbsd.
+# Building
+This program is dependant on libdb. On linux, it is also dependant on libbsd. So make sure to:
+```sh
+sudo apt install libdb-dev libbsd-dev
+```
+Or equivalent.
+
+Then you should just have to:
+```sh
+make
+```
+
+On Alpine Linux you might need to:
+```sh
+make ALPINE=y
+```
 
 # Acknowledgements
 Leon, thanks for your help debugging the program and for putting up with me.
